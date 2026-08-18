@@ -1,0 +1,21 @@
+services:
+  python:
+    build: .
+    container_name: ex2_python
+    volumes:
+      - .:/app
+    working_dir: /app
+    tty: true
+    depends_on:
+      - mysql
+
+  mysql:
+    image: mysql:8.0
+    container_name: ex2_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: ex2
+      MYSQL_USER: user
+      MYSQL_PASSWORD: password
+    ports:
+      - "3307:3306"

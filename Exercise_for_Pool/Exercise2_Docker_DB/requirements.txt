@@ -1,0 +1,6 @@
+sqlalchemy
+pandas
+requests
+pymysql
+beautifulsoup4
+cryptography
