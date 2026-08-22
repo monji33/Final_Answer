@@ -21,6 +21,7 @@ SEARCH_URLS = [
 ]
 
 TARGET_COUNT = 50
+CANDIDATE_COUNT = 80
 WAIT_SECONDS = 3
 
 HEADERS = {
@@ -253,7 +254,7 @@ def collect_store_urls(session):
             if store_url not in store_urls:
                 store_urls.append(store_url)
 
-            if len(store_urls) >= TARGET_COUNT:
+            if len(store_urls) >= CANDIDATE_COUNT:
                 break
 
         print(
@@ -262,7 +263,7 @@ def collect_store_urls(session):
         )
 
     
-    return store_urls[:TARGET_COUNT]
+    return store_urls[:CANDIDATE_COUNT]
 
 
 # =========================================================
@@ -376,46 +377,45 @@ def normalize_address_text(text):
 
 def split_street_address(street_address):
     """
-    streetAddressを番地と建物名に分割する。
-
-    例：
-    砂山町322-6一兆ビル2F
-    ↓
-    番地：砂山町322-6
-    建物名：一兆ビル2F
+    streetAddressを
+    「町名」「番地」「建物名」に分割する。
     """
-    street_address = normalize_address_text(
-        street_address
-    )
+    street_address = normalize_address_text(street_address)
 
     if not street_address:
-        return "", ""
+        return "", "", ""
 
-    pattern = re.compile(
-        r"^(.+?"
-        r"\d+"
-        r"(?:[-ー‐−－]\d+)*"
-        r"(?:番地?|号)?)"
+    numeric_town_pattern = re.compile(
+        r"^(\d+[^\d]+?)"
+        r"(\d+(?:[-ー‐−－]\d+)*(?:番地?|号)?)"
         r"(.*)$"
     )
 
-    match = pattern.match(
-        street_address
-    )
+    match = numeric_town_pattern.match(street_address)
 
     if match:
-        block_number = match.group(
-            1
-        ).strip()
+        return (
+            match.group(1).strip(),
+            match.group(2).strip(),
+            match.group(3).strip()
+        )
 
-        building_name = match.group(
-            2
-        ).strip()
+    normal_pattern = re.compile(
+        r"^(.+?)"
+        r"(\d+(?:[-ー‐−－]\d+)*(?:番地?|号)?)"
+        r"(.*)$"
+    )
 
-        return block_number, building_name
+    match = normal_pattern.match(street_address)
 
-    return street_address, ""
+    if match:
+        return (
+            match.group(1).strip(),
+            match.group(2).strip(),
+            match.group(3).strip()
+        )
 
+    return street_address, "", ""
 
 # =========================================================
 # メールアドレス取得
@@ -423,31 +423,36 @@ def split_street_address(street_address):
 
 def extract_email(soup):
     """
-    HTML内に直接記載されたメールアドレスを取得する。
-    無ければ空欄。
+    「お店に直接メールする」に対応する
+    mailtoリンクだけを取得する。
     """
-    # mailtoリンクを優先
-    for link in soup.find_all(
-        "a",
-        href=True
-    ):
+    target_text = "お店に直接メールする"
+
+    for link in soup.find_all("a", href=True):
+        link_text = link.get_text(
+            " ",
+            strip=True
+        )
+
+        if target_text not in link_text:
+            continue
+
         href = link.get(
             "href",
             ""
         ).strip()
 
-        if href.lower().startswith(
-            "mailto:"
-        ):
-            email = href[7:].split(
-                "?"
-            )[0].strip()
+        if not href.lower().startswith("mailto:"):
+            return ""
 
-            if EMAIL_PATTERN.fullmatch(
-                email
-            ):
-                return email
+        email = href[7:].split("?")[0].strip()
 
+        if EMAIL_PATTERN.fullmatch(email):
+            return email
+
+        return ""
+
+    return ""
     # HTML全体から検索
     html_text = soup.get_text(
         " ",
@@ -501,10 +506,13 @@ def is_external_url(url):
 
 def resolve_final_url(session, url):
     """
-    実際にアクセスし、リダイレクト後のURLを取得する。
+    正常遷移できた場合は最終URLを返す。
+    CAPTCHAや接続失敗時は元の外部URLを残す。
     """
     if not url:
         return ""
+
+    original_url = url
 
     try:
         response = request_page(
@@ -513,114 +521,106 @@ def resolve_final_url(session, url):
             allow_redirects=True
         )
 
-        return response.url
+        final_url = response.url
+        final_lower = final_url.lower()
+
+        captcha_words = (
+            "captcha",
+            "challenge",
+            "verify",
+        )
+
+        if any(
+            word in final_lower
+            for word in captcha_words
+        ):
+            return original_url
+
+        if not is_external_url(final_url):
+            return original_url
+
+        return final_url
 
     except requests.RequestException:
-        return ""
+        return original_url
 
 
 def extract_official_url(session, soup):
     """
-    「オフィシャルページ」
-    「お店のホームページ」などのURLを取得する。
+    URL取得優先順位
+
+    1. お店のホームページ
+    2. オフィシャルページ
+    3. オフィシャル ページ
+    4. 公式ホームページ
+    5. 公式サイト
     """
-    keywords = (
-        "オフィシャルページ",
+    priority_keywords = (
         "お店のホームページ",
+        "オフィシャルページ",
+        "オフィシャル ページ",
         "公式ホームページ",
         "公式サイト",
-        "ホームページ",
     )
 
-    # まずリンク文字から探す
-    for link in soup.find_all(
+    links = soup.find_all(
         "a",
         href=True
-    ):
-        link_text = link.get_text(
-            " ",
-            strip=True
-        )
-
-        href = link.get(
-            "href",
-            ""
-        ).strip()
-
-        if not any(
-            keyword in link_text
-            for keyword in keywords
-        ):
-            continue
-
-        absolute_url = urljoin(
-        "https://r.gnavi.co.jp/",
-        href
-        )
-        
-
-        # ぐるなびのリダイレクトリンクの場合でも
-        # requestsで最終URLを取得する
-        final_url = resolve_final_url(
-            session,
-            absolute_url
-        )
-
-        if (
-            final_url
-            and is_external_url(final_url)
-        ):
-            return final_url
-
-    # 「店舗情報」テーブル付近から外部リンクを探す
-    labels = soup.find_all(
-        string=re.compile(
-            r"オフィシャル|"
-            r"ホームページ|"
-            r"公式サイト"
-        )
     )
 
-    for label in labels:
-        parent = label.parent
+    for keyword in priority_keywords:
+        for link in links:
+            link_text = link.get_text(
+                " ",
+                strip=True
+            )
 
-        if parent is None:
-            continue
+            if keyword not in link_text:
+                continue
 
-        container = parent.find_parent(
-            ["tr", "dl", "div", "li"]
-        )
+            href = link.get(
+                "href",
+                ""
+            ).strip()
 
-        if container is None:
-            continue
+            if not href:
+                continue
 
-        link = container.find(
-            "a",
-            href=True
-        )
+            absolute_url = urljoin(
+                "https://r.gnavi.co.jp/",
+                href
+            )
 
-        if link is None:
-            continue
+            if is_external_url(absolute_url):
+                original_external_url = absolute_url
 
-        absolute_url = urljoin(
-        "https://r.gnavi.co.jp/",
-        link["href"]
-        )
-    
+            else:
+                try:
+                    response = request_page(
+                        session,
+                        absolute_url,
+                        allow_redirects=True
+                    )
 
-        final_url = resolve_final_url(
-            session,
-            absolute_url
-        )
+                    candidate_url = response.url
 
-        if (
-            final_url
-            and is_external_url(final_url)
-        ):
-            return final_url
+                    if is_external_url(candidate_url):
+                        original_external_url = candidate_url
+                    else:
+                        continue
+
+                except requests.RequestException:
+                    continue
+
+            final_url = resolve_final_url(
+                session,
+                original_external_url
+            )
+
+            if is_external_url(final_url):
+                return final_url
 
     return ""
-
 
 # =========================================================
 # SSL判定
@@ -742,16 +742,17 @@ def get_store_information(
         )
     )
 
-    block_number, building_name = (
+    town_name, block_number, building_name = (
         split_street_address(
             street_address
         )
     )
 
+    city = city + town_name
+
     email = extract_email(
         soup
     )
-
     official_url = extract_official_url(
         session,
         soup
@@ -785,14 +786,19 @@ def main():
 
     store_urls = collect_store_urls(session)
 
-    print(f"取得した店舗URL数: {len(store_urls)}")
-
-    if len(store_urls) < TARGET_COUNT:
-        print("警告：50店舗分のURLを取得できませんでした。")
+    print(
+        f"取得した候補店舗URL数: {len(store_urls)}"
+    )
 
     records = []
 
-    for index, store_url in enumerate(store_urls, start=1):
+    for index, store_url in enumerate(
+        store_urls,
+        start=1
+    ):
+        if len(records) >= TARGET_COUNT:
+            break
+
         print(
             f"{index}/{len(store_urls)}件目を取得中: "
             f"{store_url}"
@@ -804,51 +810,57 @@ def main():
                 store_url
             )
 
-            records.append(store_information)
+            # 店舗名が取得できなければ
+            # 有効レコードとして数えない
+            if not store_information["店舗名"]:
+                print(
+                    "店舗名を取得できなかったため"
+                    "スキップします。"
+                )
+                continue
+
+            records.append(
+                store_information
+            )
 
             print(
                 f"取得成功: "
                 f"{store_information['店舗名']}"
             )
 
-        except requests.RequestException as error:
-            print(f"通信エラー: {error}")
+            print(
+                f"現在の有効レコード数: "
+                f"{len(records)}"
+            )
 
-            records.append({
-                "店舗名": "",
-                "電話番号": "",
-                "メールアドレス": "",
-                "都道府県": "",
-                "市区町村": "",
-                "番地": "",
-                "建物名": "",
-                "URL": "",
-                "SSL": False,
-            })
+        except requests.RequestException as error:
+            print(
+                f"通信エラーのためスキップ: "
+                f"{error}"
+            )
+            continue
 
         except Exception as error:
-            print(f"解析エラー: {error}")
+            print(
+                f"解析エラーのためスキップ: "
+                f"{error}"
+            )
+            continue
 
-            records.append({
-                "店舗名": "",
-                "電話番号": "",
-                "メールアドレス": "",
-                "都道府県": "",
-                "市区町村": "",
-                "番地": "",
-                "建物名": "",
-                "URL": "",
-                "SSL": False,
-            })
+    if len(records) < TARGET_COUNT:
+        print(
+            f"警告：有効な店舗データが"
+            f"{TARGET_COUNT}件に達しませんでした。"
+        )
 
     dataframe = pd.DataFrame(
-        records,
+        records[:TARGET_COUNT],
         columns=COLUMNS
     )
 
-    dataframe = dataframe.head(TARGET_COUNT)
-
-    engine = create_engine(DATABASE_URL)
+    engine = create_engine(
+        DATABASE_URL
+    )
 
     dataframe.to_sql(
         TABLE_NAME,
@@ -861,8 +873,26 @@ def main():
     print(
         f"MySQLの{TABLE_NAME}テーブルに保存しました。"
     )
+
     print(
         f"保存レコード数: {len(dataframe)}"
+    )
+
+    print(
+        f"店舗名あり: "
+        f"{dataframe['店舗名'].notna().sum()}"
+    )
+
+    url_count = (
+        dataframe["URL"]
+        .fillna("")
+        .str.strip()
+        .ne("")
+        .sum()
+    )
+
+    print(
+        f"URLあり: {url_count}"
     )
 
 

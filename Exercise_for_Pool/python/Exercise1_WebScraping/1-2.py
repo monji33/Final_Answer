@@ -125,55 +125,59 @@ def collect_urls_on_current_page(driver):
     return store_urls
 
 
-def click_next_button(driver, next_page_number):
-    """指定した次ページ番号のボタンをクリックする。"""
-
+def click_next_button(driver):
+    """
+    ページ下部にある「>」ボタンをクリックして
+    次の検索結果ページへ移動する。
+    """
     driver.execute_script(
         "window.scrollTo(0, document.body.scrollHeight);"
     )
 
     time.sleep(WAIT_SECONDS)
 
-    # 例：2ページ目なら p=2、3ページ目なら p=3
-    selector = f"a[href*='p={next_page_number}']"
+    selectors = [
+        "//a[normalize-space(text())='>']",
+        "//a[@aria-label='次へ']",
+        "//a[contains(@aria-label, '次')]",
+    ]
 
-    try:
-        next_button = WebDriverWait(
-            driver,
-            10
-        ).until(
-            EC.element_to_be_clickable(
-                (By.CSS_SELECTOR, selector)
+    for selector in selectors:
+        try:
+            next_button = WebDriverWait(
+                driver,
+                10
+            ).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, selector)
+                )
             )
-        )
 
-        print(
-            "次ページ候補:",
-            next_button.get_attribute("href"),
-            next_button.get_attribute("aria-label")
-        )
+            print(
+                "「>」ボタンから次ページへ移動:",
+                next_button.get_attribute("href")
+            )
 
-        driver.execute_script(
-            "arguments[0].scrollIntoView({block: 'center'});",
-            next_button
-        )
+            driver.execute_script(
+                "arguments[0].scrollIntoView("
+                "{block: 'center'});",
+                next_button
+            )
 
-        time.sleep(1)
+            time.sleep(1)
 
-        driver.execute_script(
-            "arguments[0].click();",
-            next_button
-        )
+            driver.execute_script(
+                "arguments[0].click();",
+                next_button
+            )
 
-        return True
+            return True
 
-    except TimeoutException:
-        print(
-            f"{next_page_number}ページ目のボタンを"
-            "見つけられませんでした。"
-        )
-        return False
+        except TimeoutException:
+            continue
 
+    print("ページ下部の「>」ボタンが見つかりませんでした。")
+    return False
 
 
 def normalize_text(text):
@@ -210,30 +214,81 @@ def find_restaurant_json(soup):
                         return graph_item
     return {}
 
-
 def split_street_address(street_address):
+    """
+    streetAddressを
+    「町名」「番地」「建物名」に分割する。
+    """
     street_address = normalize_text(street_address)
+
     if not street_address:
-        return "", ""
-    match = re.match(
-        r"^(.+?\d+(?:[-ー‐−－]\d+)*(?:番地?|号)?)(.*)$",
-        street_address,
+        return "", "", ""
+
+    numeric_town_pattern = re.compile(
+        r"^(\d+[^\d]+?)"
+        r"(\d+(?:[-ー‐−－]\d+)*(?:番地?|号)?)"
+        r"(.*)$"
     )
-    if not match:
-        return street_address, ""
-    return match.group(1).strip(), match.group(2).strip()
+
+    match = numeric_town_pattern.match(street_address)
+
+    if match:
+        return (
+            match.group(1).strip(),
+            match.group(2).strip(),
+            match.group(3).strip()
+        )
+
+    normal_pattern = re.compile(
+        r"^(.+?)"
+        r"(\d+(?:[-ー‐−－]\d+)*(?:番地?|号)?)"
+        r"(.*)$"
+    )
+
+    match = normal_pattern.match(street_address)
+
+    if match:
+        return (
+            match.group(1).strip(),
+            match.group(2).strip(),
+            match.group(3).strip()
+        )
+
+    return street_address, "", ""
 
 
 def extract_email(soup):
-    for link in soup.find_all("a", href=True):
-        href = link.get("href", "").strip()
-        if href.lower().startswith("mailto:"):
-            email = href[7:].split("?")[0].strip()
-            if EMAIL_PATTERN.fullmatch(email):
-                return email
-    match = EMAIL_PATTERN.search(soup.get_text(" ", strip=True))
-    return match.group(0) if match else ""
+    """
+    「お店に直接メールする」に対応する
+    mailtoリンクだけを取得する。
+    """
+    target_text = "お店に直接メールする"
 
+    for link in soup.find_all("a", href=True):
+        link_text = link.get_text(
+            " ",
+            strip=True
+        )
+
+        if target_text not in link_text:
+            continue
+
+        href = link.get(
+            "href",
+            ""
+        ).strip()
+
+        if not href.lower().startswith("mailto:"):
+            return ""
+
+        email = href[7:].split("?")[0].strip()
+
+        if EMAIL_PATTERN.fullmatch(email):
+            return email
+
+        return ""
+
+    return ""
 
 def is_external_url(url):
     if not url.startswith(("http://", "https://")):
@@ -245,34 +300,128 @@ def is_external_url(url):
 
 
 def resolve_final_url(driver, url):
+    """
+    外部URLへ遷移し、正常なら最終URLを返す。
+    CAPTCHAや接続失敗の場合は元URLを返す。
+    """
     if not url:
         return ""
-    original = driver.current_window_handle
+
+    original_url = url
+    original_window = driver.current_window_handle
+
     try:
         driver.switch_to.new_window("tab")
+
         time.sleep(WAIT_SECONDS)
         driver.get(url)
         time.sleep(WAIT_SECONDS)
-        return driver.current_url
+
+        final_url = driver.current_url
+        final_lower = final_url.lower()
+
+        captcha_words = (
+            "captcha",
+            "challenge",
+            "verify",
+        )
+
+        if any(
+            word in final_lower
+            for word in captcha_words
+        ):
+            return original_url
+
+        if not is_external_url(final_url):
+            return original_url
+
+        return final_url
+
     except Exception:
-        return ""
+        return original_url
+
     finally:
         if len(driver.window_handles) > 1:
             driver.close()
-        driver.switch_to.window(original)
+
+        driver.switch_to.window(
+            original_window
+        )
 
 
 def extract_official_url(driver, soup, store_url):
-    keywords = ("オフィシャルページ", "お店のホームページ", "公式ホームページ", "公式サイト", "ホームページ")
-    for link in soup.find_all("a", href=True):
-        text = link.get_text(" ", strip=True)
-        if not any(keyword in text for keyword in keywords):
-            continue
-        final_url = resolve_final_url(driver, urljoin(store_url, link["href"]))
-        if final_url and is_external_url(final_url):
-            return final_url
-    return ""
+    """
+    URL取得優先順位
 
+    1. お店のホームページ
+    2. オフィシャルページ
+    3. オフィシャル ページ
+    4. 公式ホームページ
+    5. 公式サイト
+    """
+    priority_keywords = (
+        "お店のホームページ",
+        "オフィシャルページ",
+        "オフィシャル ページ",
+        "公式ホームページ",
+        "公式サイト",
+    )
+
+    links = soup.find_all(
+        "a",
+        href=True
+    )
+
+    for keyword in priority_keywords:
+        for link in links:
+            text = link.get_text(
+                " ",
+                strip=True
+            )
+
+            if keyword not in text:
+                continue
+
+            href = link.get(
+                "href",
+                ""
+            ).strip()
+
+            if not href:
+                continue
+
+            candidate_url = urljoin(
+                store_url,
+                href
+            )
+
+            if is_external_url(candidate_url):
+                original_external_url = (
+                    candidate_url
+                )
+
+            else:
+                original_external_url = (
+                    resolve_final_url(
+                        driver,
+                        candidate_url
+                    )
+                )
+
+                if not is_external_url(
+                    original_external_url
+                ):
+                    continue
+
+            final_url = resolve_final_url(
+                driver,
+                original_external_url
+            )
+
+            if is_external_url(final_url):
+                return final_url
+
+    return ""
 
 def check_ssl(url):
     if not url or urlparse(url).scheme.lower() != "https":
@@ -293,83 +442,212 @@ def get_store_information(driver, store_url):
     time.sleep(WAIT_SECONDS)
     driver.get(store_url)
     time.sleep(WAIT_SECONDS)
-    soup = BeautifulSoup(driver.page_source, "html.parser")
+
+    soup = BeautifulSoup(
+        driver.page_source,
+        "html.parser"
+    )
+
     data = find_restaurant_json(soup)
-    address = data.get("address", {})
+
+    address = data.get(
+        "address",
+        {}
+    )
+
     if not isinstance(address, dict):
         address = {}
-    block, building = split_street_address(address.get("streetAddress", ""))
-    official_url = extract_official_url(driver, soup, store_url)
+
+    town_name, block, building = split_street_address(
+        address.get(
+            "streetAddress",
+            ""
+        )
+    )
+
+    city = normalize_text(
+        address.get(
+            "addressLocality",
+            ""
+        )
+    )
+
+    city = city + town_name
+
+    official_url = extract_official_url(
+        driver,
+        soup,
+        store_url
+    )
+
     return {
-        "店舗名": normalize_text(data.get("name", "")),
-        "電話番号": normalize_text(data.get("telephone", "")),
+        "店舗名": normalize_text(
+            data.get("name", "")
+        ),
+        "電話番号": normalize_text(
+            data.get("telephone", "")
+        ),
         "メールアドレス": extract_email(soup),
-        "都道府県": normalize_text(address.get("addressRegion", "")),
-        "市区町村": normalize_text(address.get("addressLocality", "")),
+        "都道府県": normalize_text(
+            address.get("addressRegion", "")
+        ),
+        "市区町村": city,
         "番地": block,
         "建物名": building,
         "URL": official_url,
         "SSL": check_ssl(official_url),
     }
-
 def main():
     driver = create_driver()
     store_urls = []
+    candidate_count = 80
 
     try:
-        for search_number, search_url in enumerate(SEARCH_URLS, start=1):
-            if len(store_urls) >= TARGET_COUNT:
+        for search_number, search_url in enumerate(
+            SEARCH_URLS,
+            start=1
+        ):
+            if len(store_urls) >= candidate_count:
                 break
 
-            print(f"\n検索条件{search_number}を開始します。")
+            print(
+                f"\n検索条件{search_number}を開始します。"
+            )
+
             time.sleep(WAIT_SECONDS)
             driver.get(search_url)
             time.sleep(WAIT_SECONDS)
+
             page_number = 1
 
-            while len(store_urls) < TARGET_COUNT:
-                print(f"{page_number}ページ目を確認中")
-                for store_url in collect_urls_on_current_page(driver):
+            while len(store_urls) < candidate_count:
+                print(
+                    f"{page_number}ページ目を確認中"
+                )
+
+                current_page_urls = (
+                    collect_urls_on_current_page(
+                        driver
+                    )
+                )
+
+                for store_url in current_page_urls:
                     if store_url not in store_urls:
                         store_urls.append(store_url)
-                    if len(store_urls) >= TARGET_COUNT:
+
+                    if len(store_urls) >= candidate_count:
                         break
 
-                print(f"現在の店舗URL数: {len(store_urls)}")
-                if len(store_urls) >= TARGET_COUNT:
+                print(
+                    f"現在の店舗URL数: "
+                    f"{len(store_urls)}"
+                )
+
+                if len(store_urls) >= candidate_count:
                     break
 
                 old_url = driver.current_url
-                next_page_number = page_number + 1
-                if not click_next_button(driver, next_page_number):
-                    print("この検索条件の最終ページです。")
+
+                if not click_next_button(driver):
+                    print(
+                        "この検索条件の最終ページです。"
+                    )
                     break
 
                 time.sleep(WAIT_SECONDS)
+
                 try:
-                    WebDriverWait(driver, 15).until(lambda browser: browser.current_url != old_url)
+                    WebDriverWait(
+                        driver,
+                        15
+                    ).until(
+                        lambda browser:
+                        browser.current_url != old_url
+                    )
+
                 except TimeoutException:
-                    print("ページ移動を確認できませんでした。")
+                    print(
+                        "ページ移動を確認できませんでした。"
+                    )
                     break
+
                 page_number += 1
 
-        print(f"\n取得した店舗URL数: {len(store_urls)}")
+        print(
+            f"\n取得した店舗URL数: "
+            f"{len(store_urls)}"
+        )
+
         records = []
 
-        for index, store_url in enumerate(store_urls[:TARGET_COUNT], start=1):
-            print(f"{index}/{len(store_urls[:TARGET_COUNT])}件目を取得中: {store_url}")
-            try:
-                record = get_store_information(driver, store_url)
-                records.append(record)
-                print(f"取得成功: {record['店舗名']}")
-            except Exception as error:
-                print(f"解析エラー: {error}")
-                records.append({column: (False if column == "SSL" else "") for column in COLUMNS})
+        for index, store_url in enumerate(
+            store_urls,
+            start=1
+        ):
+            if len(records) >= TARGET_COUNT:
+                break
 
-        dataframe = pd.DataFrame(records, columns=COLUMNS).head(TARGET_COUNT)
-        dataframe.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
-        print(f"\n{OUTPUT_FILE}を保存しました。")
-        print(f"保存レコード数: {len(dataframe)}")
+            print(
+                f"{index}/{len(store_urls)}件目を取得中: "
+                f"{store_url}"
+            )
+
+            try:
+                record = get_store_information(
+                    driver,
+                    store_url
+                )
+
+                if not record["店舗名"]:
+                    print(
+                        "店舗名を取得できなかったため"
+                        "スキップします。"
+                    )
+                    continue
+
+                records.append(record)
+
+                print(
+                    f"取得成功: "
+                    f"{record['店舗名']}"
+                )
+
+                print(
+                    f"現在の有効レコード数: "
+                    f"{len(records)}"
+                )
+
+            except Exception as error:
+                print(
+                    f"解析エラーのためスキップ: "
+                    f"{error}"
+                )
+                continue
+
+        if len(records) < TARGET_COUNT:
+            print(
+                f"警告：有効な店舗データが"
+                f"{TARGET_COUNT}件に達しませんでした。"
+            )
+
+        dataframe = pd.DataFrame(
+            records[:TARGET_COUNT],
+            columns=COLUMNS
+        )
+
+        dataframe.to_csv(
+            OUTPUT_FILE,
+            index=False,
+            encoding="utf-8-sig"
+        )
+
+        print(
+            f"\n{OUTPUT_FILE}を保存しました。"
+        )
+        print(
+            f"保存レコード数: "
+            f"{len(dataframe)}"
+        )
 
     finally:
         driver.quit()
